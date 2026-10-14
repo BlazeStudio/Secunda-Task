@@ -1,0 +1,86 @@
+name: payments
+
+x-app: &app
+  build: .
+  image: payments-service:latest
+  restart: unless-stopped
+  environment: &app-env
+    DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
+    RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  depends_on:
+    postgres:
+      condition: service_healthy
+    rabbitmq:
+      condition: service_healthy
+    migrations:
+      condition: service_completed_successfully
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+      POSTGRES_DB: payments
+    volumes:
+      # since 18 the image keeps PGDATA in a versioned subdirectory of this path
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  rabbitmq:
+    image: rabbitmq:4.3-management-alpine
+    hostname: rabbitmq  # the data directory is tied to the node name
+    ports:
+      - "${RABBITMQ_UI_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  migrations:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    environment:
+      <<: *app-env
+      API_KEY: ${API_KEY:-dev-api-key-change-me}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  outbox-relay:
+    <<: *app
+    command: ["python", "-m", "app.relay"]
+
+  consumer:
+    <<: *app
+    command: ["python", "-m", "app.consumer"]
+
+  # Logs every request it gets: handy as a webhook target when trying the service out
+  webhook-receiver:
+    image: mendhak/http-https-echo:42
+    environment:
+      HTTP_PORT: 8080
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  rabbitmq-data:
