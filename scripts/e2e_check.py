@@ -193,6 +193,7 @@ class Report:
     def __init__(self) -> None:
         self.passed = 0
         self.failed: list[str] = []
+        self._section = ""
 
     def check(self, name: str, ok: Json, details: Json = "") -> bool:
         if ok:
@@ -203,14 +204,23 @@ class Report:
             print(f"  [FAIL] {name}")
             if details not in ("", None):
                 print(f"         {details}")
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                # becomes an annotation on the run page, readable without opening the logs
+                message = f"{self._section}: {name} {details}"
+                print(f"::error title=e2e check::{_escape_annotation(message)}")
         return bool(ok)
 
     def section(self, title: str, body: Callable[["Report"], None]) -> None:
+        self._section = title
         print(f"\n== {title} ==")
         try:
             body(self)
         except Exception as exc:  # keep going with the next section
             self.check(f"раздел прерван: {exc!r}", False)
+
+
+def _escape_annotation(text: str) -> str:
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
 def info(text: str) -> None:
@@ -227,6 +237,14 @@ def environment(r: Report) -> None:
     r.check("приёмник webhook'ов доступен", http("GET", f"{RECEIVER_URL}/health").status == 200)
     version = sql("select version_num from alembic_version")
     r.check("PostgreSQL доступен, миграции применены", version == "0001", version)
+
+    # the consumer has no healthcheck, so `compose up --wait` can return before it
+    # subscribes, and the management stats lag behind by a few seconds on top of that
+    def consumers() -> int:
+        count: int = rabbit("GET", "/queues/%2F/payments.new").body.get("consumers") or 0
+        return count
+
+    r.check("consumer подписан на payments.new", wait_for(consumers, timeout=15))
 
 
 def auth(r: Report) -> None:
@@ -352,7 +370,6 @@ def topology(r: Report) -> None:
         "payments.new привязана к exchange payments по ключу payment.created",
         "payment.created" in binding_keys("payments", "payments.new"),
     )
-    r.check("у payments.new есть подписчик (consumer)", (main.get("consumers") or 0) >= 1)
     r.check(
         "очередь payments.new.dlq привязана к payments.dlx",
         queue("payments.new.dlq").get("durable")
