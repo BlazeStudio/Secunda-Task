@@ -74,11 +74,20 @@ services:
     <<: *app
     command: ["python", "-m", "app.consumer"]
 
-  # Logs every request it gets: handy as a webhook target when trying the service out
+  # Stands in for the merchant's server: records webhooks and shows them at
+  # http://localhost:8081/, see scripts/webhook_receiver.py
   webhook-receiver:
-    image: mendhak/http-https-echo:42
-    environment:
-      HTTP_PORT: 8080
+    image: python:3.13-alpine
+    command: ["python", "-u", "/receiver.py"]
+    volumes:
+      - ./scripts/webhook_receiver.py:/receiver.py:ro
+    ports:
+      - "${WEBHOOK_RECEIVER_PORT:-8081}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
 volumes:

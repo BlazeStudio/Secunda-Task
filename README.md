@@ -19,35 +19,54 @@ docker compose up --build -d
 | `api` | HTTP API, http://localhost:8000, Swagger — http://localhost:8000/docs |
 | `outbox-relay` | перекладывает события из таблицы `outbox` в RabbitMQ |
 | `consumer` | обрабатывает платежи и шлёт webhook'и |
-| `webhook-receiver` | эхо-сервер, пишет в лог всё, что ему прислали; удобная цель для webhook'ов |
-
-Панель RabbitMQ: http://localhost:15672 (guest / guest).
+| `webhook-receiver` | тестовый «сервер клиента»: принимает webhook'и и показывает их на http://localhost:8081 |
 
 API-ключ по умолчанию — `dev-api-key-change-me`. Ключ и порты переопределяются через `.env` (см. `.env.example`).
 
-Быстрая проверка всего контура (нужен только Python, без зависимостей):
+## Проверка всего функционала
 
 ```bash
-python scripts/smoke_test.py
+python scripts/e2e_check.py
 ```
 
-Скрипт создаёт платёж, проверяет идемпотентность, дожидается обработки и убеждается, что сообщение с недоступным webhook'ом в итоге попадает в DLQ.
+Скрипт без зависимостей (нужен только Python 3.11+) проходит по всем пунктам ТЗ на живом окружении и печатает результат по каждой проверке, в конце сводку. Занимает около 40 секунд:
+
+1. окружение: API, Swagger, RabbitMQ, PostgreSQL и применённые миграции;
+2. авторизация по `X-API-Key`;
+3. валидация тела, заголовка `Idempotency-Key` и UUID в пути;
+4. создание платежа и идемпотентность: повтор, конфликт, 10 параллельных запросов с одним ключом, ровно одна запись в `payments` и `outbox`;
+5. топология RabbitMQ: exchange'и, очереди, привязки, DLX, очереди задержки;
+6. полный путь outbox → relay → consumer → webhook, тело webhook'а совпадает с `GET`;
+7. ретраи: паузы ~2 и ~4 с, повторного списания нет, после третьей неудачи сообщение в DLQ;
+8. битые сообщения уходят в DLQ сразу;
+9. 20 платежей параллельно, каждый клиент получает ровно один webhook;
+10. падение брокера: RabbitMQ останавливается, платёж всё равно принимается и ждёт в outbox, после запуска брокера доходит до клиента. Пропустить: `--skip-outage`.
+
+Код возврата 0, если всё прошло, иначе 1. Этот же скрипт запускается в CI.
+
+## Где смотреть результат
+
+Графического интерфейса у сервиса нет и по ТЗ он не нужен. Всё видно через стандартные инструменты:
+
+| Что | Где |
+|---|---|
+| Ручные запросы к API | Swagger: http://localhost:8000/docs, кнопка **Authorize**, ключ `dev-api-key-change-me` |
+| Пришедшие webhook'и | http://localhost:8081/ — все, http://localhost:8081/demo — только на путь `/demo`; в каждом номер попытки, код ответа, время и тело |
+| Очереди, exchange'и, DLQ | http://localhost:15672 (guest / guest): Exchanges → `payments`, `payments.dlx`; Queues → `payments.new`, `payments.new.retry.*`, `payments.new.dlq`; содержимое DLQ — Get messages |
+| Что делают процессы | `docker compose logs -f consumer outbox-relay webhook-receiver` |
+| Таблицы | `docker compose exec postgres psql -U payments -c "select id, status, processed_at from payments"` и `... "select * from outbox"` |
 
 ## Примеры
 
 Создание платежа:
 
 ```bash
-curl -i -X POST http://localhost:8000/api/v1/payments \
-  -H "X-API-Key: dev-api-key-change-me" \
-  -H "Idempotency-Key: 3f1c2a9e-order-1042" \
-  -H "Content-Type: application/json" \
-  -d '{
+curl -i -X POST http://localhost:8000/api/v1/payments   -H "X-API-Key: dev-api-key-change-me"   -H "Idempotency-Key: 3f1c2a9e-order-1042"   -H "Content-Type: application/json"   -d '{
         "amount": "1500.00",
         "currency": "RUB",
         "description": "Order #1042",
         "metadata": {"order_id": 1042},
-        "webhook_url": "http://webhook-receiver:8080/payments"
+        "webhook_url": "http://webhook-receiver:8080/demo"
       }'
 ```
 
@@ -60,11 +79,10 @@ location: /api/v1/payments/0b5e4a52-7f43-4c55-a5c1-2a8c1d0a7a51
 
 Повтор того же запроса с тем же `Idempotency-Key` вернёт тот же платёж (и заголовок `Idempotent-Replayed: true`), новый платёж не создаётся. Тот же ключ с другим телом — `409 Conflict`.
 
-Получение платежа:
+Через 2–5 секунд платёж обработан:
 
 ```bash
-curl http://localhost:8000/api/v1/payments/0b5e4a52-7f43-4c55-a5c1-2a8c1d0a7a51 \
-  -H "X-API-Key: dev-api-key-change-me"
+curl http://localhost:8000/api/v1/payments/0b5e4a52-7f43-4c55-a5c1-2a8c1d0a7a51   -H "X-API-Key: dev-api-key-change-me"
 ```
 
 ```json
@@ -76,19 +94,15 @@ curl http://localhost:8000/api/v1/payments/0b5e4a52-7f43-4c55-a5c1-2a8c1d0a7a51 
   "metadata": {"order_id": 1042},
   "status": "succeeded",
   "idempotency_key": "3f1c2a9e-order-1042",
-  "webhook_url": "http://webhook-receiver:8080/payments",
+  "webhook_url": "http://webhook-receiver:8080/demo",
   "created_at": "2026-10-14T09:12:03.512345Z",
   "processed_at": "2026-10-14T09:12:07.044120Z"
 }
 ```
 
-Webhook приходит `POST`-запросом на `webhook_url` с этим же JSON в теле. Посмотреть, что получил тестовый приёмник:
+Webhook приходит `POST`-запросом на `webhook_url` с этим же JSON в теле; он появится на http://localhost:8081/demo.
 
-```bash
-docker compose logs -f webhook-receiver
-```
-
-Чтобы увидеть ретраи и DLQ, достаточно указать адрес, где никто не слушает, например `"webhook_url": "http://webhook-receiver:9/payments"`. В логах `consumer` будут три попытки, после чего сообщение окажется в очереди `payments.new.dlq`.
+Тестовый приёмник умеет имитировать сбои клиента: параметр `?fail=N` в `webhook_url` заставляет его отвечать `503` на первые N запросов. С `http://webhook-receiver:8080/flaky?fail=2` будут видны две неудачные попытки с паузами 2 и 4 секунды и успешная третья. С `http://webhook-receiver:8080/dead?fail=100` после трёх попыток сообщение окажется в очереди `payments.new.dlq`.
 
 ## API
 
@@ -199,7 +213,7 @@ uv run mypy app tests scripts
 - consumer: обработка, повторная доставка без повторного списания, гонка двух обработчиков, ретраи с задержкой, попадание в DLQ после трёх попыток, битые сообщения;
 - миграции: соответствие моделям (`alembic check`) и цикл upgrade → downgrade → upgrade.
 
-В CI (`.github/workflows/ci.yml`) — линтеры, тесты и прогон `scripts/smoke_test.py` на поднятом `docker compose`.
+В CI (`.github/workflows/ci.yml`) — линтеры, тесты и `scripts/e2e_check.py` на поднятом `docker compose`.
 
 ## Структура
 
@@ -216,6 +230,6 @@ app/
   schemas.py      Pydantic-схемы
   services.py     создание платежа: идемпотентность + outbox
 migrations/       Alembic
-scripts/          smoke-тест для поднятого окружения
+scripts/          e2e-проверка поднятого окружения и тестовый приёмник webhook'ов
 tests/
 ```
